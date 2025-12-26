@@ -1,0 +1,987 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Glyph FPS (Japanese) -- DEPTH + DIFF(feedback,glyphs)</title>
+  <style>
+    html,body{margin:0;height:100%;background:#050607;overflow:hidden;}
+    canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated;}
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+(() => {
+  // ============================================================
+  // LIFTED PIPELINE (from your previous project):
+  //
+  // 1) Render crisp glyph world into offscreen "gc" (full-res)
+  // 2) Build low-res feedback buffer "fbC" from gc:
+  //    - persistence: fbC draws itself with drift + alpha
+  //    - inject: draw gc into fbC with "lighter" alpha
+  //    - damping: multiply dark fill to prevent runaway
+  // 3) Primary image on screen:
+  //    ctx.drawImage(gc)
+  //    ctx.globalCompositeOperation="difference"
+  //    ctx.drawImage(fbC, scaled up)
+  //    ctx.globalCompositeOperation="multiply" (deepen blacks)
+  //
+  // This is NOT frame-to-frame diff. It's DIFF(glyphs, feedback).
+  //
+  // Extra (optional): "sumi multi-pass" glyph stamping modulated by a
+  // coarse sample of fbC. Toggle with M. Default OFF for performance.
+  // ============================================================
+
+  const CFG = {
+    RES_SCALE: 1.0,
+
+    // One glyph per cell (grid resolution = main perf lever)
+    GRID_COLS: 160,
+    GRID_ROWS: 0, // derived
+
+    // World/camera
+    FOV: Math.PI / 3.0,
+    MAX_DIST: 32,
+    MOVE_SPEED: 3.3,
+    SPRINT_MULT: 1.65,
+    TURN_SENS: 0.0022,
+    PROJ_SCALE: 1.15,
+
+    // Glyph tile sizing (still respects distance, but we're drawing as tiles within cells)
+    FONT_FAMILY: 'ui-monospace, "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP", Menlo, Monaco, Consolas, monospace',
+    BASE_TILE_PX: 22,
+    GLYPH_SCALE: 1.0,
+
+    // Mode: billboard glyphs (no cell-fit) + quantised scale jumps
+    BILLBOARD_MODE: false,
+    QUANT_STEPS: [1,4,16,64],
+    QUANT_INDEX: 0,
+
+    // Billboard performance controls
+    BILLBOARD_BASE_COLS: 120,
+    BILLBOARD_MIN_COLS: 40,
+    BILLBOARD_SKIP_MAX: 8,
+    MIN_TILE_PX: 7,
+    SIZE_BUCKETS: 18,
+    BRIGHT_BUCKETS: 18,
+    COLOR_MODE: 0, // 0=default, 1=4-colour vibrant, 2=red/black/brown, 3=hot-red spectrum
+
+    OUTLINE_MODE: 0, // 0=off, 1=diffed loose, 2=top-layer building silhouette
+
+    OUTLINE: true,
+
+    // Depth cues
+    FOG_START: 8,
+    FOG_END: 30,
+
+    // Feedback (matches your previous project defaults)
+    FEEDBACK_ON: true,
+    FB_SCALE: 0.22,        // low-res feedback buffer relative scale
+    FB_PERSIST_ALPHA: 0.965,
+    FB_PERSIST_DX: 0.6,
+    FB_PERSIST_DY: -0.2,
+    FB_INJECT_ALPHA: 0.62,
+    FB_DAMP_ALPHA: 0.18,
+    FB_DAMP_RGB: "rgb(20,18,26)",
+
+    // Diff composite (also matches)
+    DIFF_ON: true,
+    DIFF_ALPHA: 0.92,
+
+    // Deepen blacks
+    BLACKS_ON: true,
+    BLACKS_ALPHA: 0.16,
+    BLACKS_RGB: "rgb(18,16,24)",
+
+    // Optional sumi multi-pass (off by default)
+    SUMI_ON: false,
+    SUMI_PASSES: [
+      {a:0.16, s:0.24},
+      {a:0.30, s:0.16},
+      {a:0.52, s:0.09},
+      {a:0.78, s:0.03},
+    ],
+    SUMI_SAMPLE_MIN_W: 32,
+    SUMI_SAMPLE_MIN_H: 24,
+    SUMI_SAMPLE_DIV: 2, // sample grid = cols/div, rows/div (clamped)
+  };
+
+  const cvs = document.getElementById('c');
+  const ctx = cvs.getContext('2d', { alpha:false, desynchronized:true });
+
+  // Offscreen glyph surface (full-res)
+  const gc = document.createElement('canvas');
+  const gctx = gc.getContext('2d', { alpha:false, desynchronized:true });
+
+  // Feedback buffer (low-res)
+  const fbC = document.createElement('canvas');
+
+  // Outline overlay (mode 2): drawn on top, not diffed
+  const ocOutline = document.createElement('canvas');
+  const octxOutline = ocOutline.getContext('2d', { alpha:true, desynchronized:true });
+  const fbCtx = fbC.getContext('2d', { alpha:false, desynchronized:true });
+
+  // Proxy glyph surface for feedback when BILLBOARD_MODE is on (cell-fit render)
+  const gcProxy = document.createElement('canvas');
+  const gctxProxy = gcProxy.getContext('2d', { alpha:false, desynchronized:true });
+
+  function resize(){
+    const w = Math.max(1, (innerWidth  * CFG.RES_SCALE) | 0);
+    const h = Math.max(1, (innerHeight * CFG.RES_SCALE) | 0);
+    cvs.width=w; cvs.height=h;
+    gc.width=w;  gc.height=h;
+
+    ocOutline.width = w;
+    ocOutline.height = h;
+    gcProxy.width = w;
+    gcProxy.height = h;
+
+    fbC.width = Math.max(64, (w * CFG.FB_SCALE) | 0);
+    fbC.height= Math.max(64, (h * CFG.FB_SCALE) | 0);
+
+    ctx.setTransform(1,0,0,1,0,0);
+    gctx.setTransform(1,0,0,1,0,0);
+    fbCtx.setTransform(1,0,0,1,0,0);
+
+    // clear
+    gctx.fillStyle="#050607"; gctx.fillRect(0,0,w,h);
+    gctxProxy.fillStyle="#050607"; gctxProxy.fillRect(0,0,w,h);
+    octxOutline.clearRect(0,0,w,h);
+    fbCtx.fillStyle="#050607"; fbCtx.fillRect(0,0,fbC.width,fbC.height);
+  }
+  addEventListener('resize', resize, { passive:true });
+  resize();
+
+  // World
+  const W=96, H=96;
+  const world = new Uint8Array(W*H);
+  const hmap = new Float32Array(W*H); // per-cell wall height factor (brutalist towers)
+
+  function idx(x,y){ return x+y*W; }
+  function inb(x,y){ return x>=0&&y>=0&&x<W&&y<H; }
+
+  // Player must exist before genWorld() (maze generation uses spawn reference)
+  const player={ x:10.5, y:10.5, a:0.2 };
+
+  // PRNG
+  let seed=((Date.now() ^ ((Math.random()*1e9)|0)) >>> 0);
+  function rand(){
+    seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+    return (seed>>>0)/4294967296;
+  }
+
+  function genWorld(){
+    // Perfect maze via recursive backtracker on an odd grid, then map into world[].
+    world.fill(1); // start as all walls
+
+    // Maze cell grid dimensions (odd coordinates are cells, even are walls)
+    const cellW = ((W-1) / 2) | 0;
+    const cellH = ((H-1) / 2) | 0;
+
+    // Helper to map cell coords to world coords (odd positions)
+    const cx2x = (cx)=> 1 + cx*2;
+    const cy2y = (cy)=> 1 + cy*2;
+
+    // Carve a cell in world space
+    function carveCell(cx, cy){
+      const x = cx2x(cx), y = cy2y(cy);
+      world[idx(x,y)] = 0;
+    }
+    // Carve a wall between two adjacent cells (in world space)
+    function carveBetween(cx, cy, nx, ny){
+      const x1 = cx2x(cx), y1 = cy2y(cy);
+      const x2 = cx2x(nx), y2 = cy2y(ny);
+      world[idx((x1+x2)>>1, (y1+y2)>>1)] = 0;
+    }
+
+    // Stack-based backtracker (avoid recursion)
+    const visited = new Uint8Array(cellW*cellH);
+    const stack = [];
+    function cidx(cx, cy){ return cx + cy*cellW; }
+
+    // Start near player spawn area (so there is always a path outward)
+    let startCX = Math.max(0, Math.min(cellW-1, ((player.x|0)-1)>>1));
+    let startCY = Math.max(0, Math.min(cellH-1, ((player.y|0)-1)>>1));
+
+    stack.push([startCX, startCY]);
+    visited[cidx(startCX,startCY)] = 1;
+    carveCell(startCX,startCY);
+
+    while (stack.length){
+      const [cx, cy] = stack[stack.length-1];
+
+      // Gather unvisited neighbors
+      const nbrs = [];
+      if (cx>0         && !visited[cidx(cx-1,cy)]) nbrs.push([cx-1,cy]);
+      if (cx<cellW-1   && !visited[cidx(cx+1,cy)]) nbrs.push([cx+1,cy]);
+      if (cy>0         && !visited[cidx(cx,cy-1)]) nbrs.push([cx,cy-1]);
+      if (cy<cellH-1   && !visited[cidx(cx,cy+1)]) nbrs.push([cx,cy+1]);
+
+      if (!nbrs.length){
+        stack.pop();
+        continue;
+      }
+      const [nx, ny] = nbrs[(rand()*nbrs.length)|0];
+      visited[cidx(nx,ny)] = 1;
+      carveCell(nx,ny);
+      carveBetween(cx,cy,nx,ny);
+      stack.push([nx,ny]);
+    }
+
+    // Ensure outer border walls (already walls, but make explicit)
+    for (let x=0;x<W;x++){ world[idx(x,0)]=1; world[idx(x,H-1)]=1; }
+    for (let y=0;y<H;y++){ world[idx(0,y)]=1; world[idx(W-1,y)]=1; }
+
+    // Punch a few extra loops so it isn't strictly perfect
+    const loops = 180;
+    for (let i=0;i<loops;i++){
+      const x = 2 + (rand()*(W-4)|0);
+      const y = 2 + (rand()*(H-4)|0);
+      if (((x|0)&1)===0 && ((y|0)&1)===0) continue; // avoid carving 4-way junction blocks too aggressively
+      // carve occasional walls adjacent to corridors
+      if (world[idx(x,y)]===1){
+        // only carve if it connects two open spaces (creates loops)
+        const openN = (world[idx(x+1,y)]===0) + (world[idx(x-1,y)]===0) + (world[idx(x,y+1)]===0) + (world[idx(x,y-1)]===0);
+        if (openN>=2) world[idx(x,y)] = 0;
+      }
+    }
+
+    // Clear a spawn "room" and guarantee connectivity from spawn
+    const sx = player.x|0, sy = player.y|0;
+    for (let yy=sy-3; yy<=sy+3; yy++){
+      for (let xx=sx-3; xx<=sx+3; xx++){
+        if (inb(xx,yy)) world[idx(xx,yy)] = 0;
+      }
+    }
+
+
+
+    
+    // Slight global widening: gently relax walls adjacent to open space (~30% chance)
+    // This increases spacing without destroying block structure.
+    const worldSoft = world.slice();
+    for (let y=1; y<H-1; y++){
+      for (let x=1; x<W-1; x++){
+        if (worldSoft[idx(x,y)]===0){
+          if (rand()<0.30) world[idx(x+1,y)] = 0;
+          if (rand()<0.30) world[idx(x-1,y)] = 0;
+          if (rand()<0.30) world[idx(x,y+1)] = 0;
+          if (rand()<0.30) world[idx(x,y-1)] = 0;
+        }
+      }
+    }
+
+// Widen ~50% of corridor gaps to be ~100% larger (1-tile -> 2-tiles wide).
+    // Heuristic: infer corridor orientation from open neighbors, then carve one perpendicular side.
+    const openCells = [];
+    for (let y=2; y<H-2; y++){
+      for (let x=2; x<W-2; x++){
+        if (world[idx(x,y)]===0) openCells.push([x,y]);
+      }
+    }
+    // Fisher–Yates shuffle
+    for (let i=openCells.length-1;i>0;i--){
+      const j=(rand()*(i+1))|0;
+      const tmp=openCells[i]; openCells[i]=openCells[j]; openCells[j]=tmp;
+    }
+    const target = (openCells.length*0.50)|0;
+    for (let i=0;i<target;i++){
+      const x=openCells[i][0], y=openCells[i][1];
+
+      // Don't widen inside spawn pocket (keeps start readable)
+      if (Math.abs(x-(player.x|0))<=4 && Math.abs(y-(player.y|0))<=4) continue;
+
+      const ox = (world[idx(x+1,y)]===0) + (world[idx(x-1,y)]===0);
+      const oy = (world[idx(x,y+1)]===0) + (world[idx(x,y-1)]===0);
+
+      // If corridor seems horizontal, widen vertically; if vertical, widen horizontally.
+      if (ox >= oy){
+        // widen in y
+        const dir = rand()<0.5 ? -1 : 1;
+        const y2 = y + dir;
+        if (world[idx(x,y2)]===1) world[idx(x,y2)] = 0;
+      } else {
+        // widen in x
+        const dir = rand()<0.5 ? -1 : 1;
+        const x2 = x + dir;
+        if (world[idx(x2,y)]===1) world[idx(x2,y)] = 0;
+      }
+    }
+
+    // Brutalist tower heights: clustered peaks + canyoning by corridor adjacency.
+    for (let i=0;i<W*H;i++) hmap[i]=1.0;
+
+    const cores=[];
+    const coreCount=44;
+    for (let i=0;i<coreCount;i++){
+      const x=2 + (rand()*(W-4)|0);
+      const y=2 + (rand()*(H-4)|0);
+      cores.push([x,y, 1.8 + rand()*4.2]); // peak factor
+    }
+
+    for (let y=1;y<H-1;y++){
+      for (let x=1;x<W-1;x++){
+        const id=idx(x,y);
+        if (world[id]===0){ hmap[id]=0; continue; }
+
+        // stable base per cell
+        const n=((x*73856093) ^ (y*19349663) ^ 0x9e3779b9)>>>0;
+        let base=0.9 + ((n&1023)/1023)*1.0; // 0.9..1.9
+
+        // clustered towers
+        let tower=0.0;
+        for (let k=0;k<cores.length;k++){
+          const cx=cores[k][0], cy=cores[k][1], peak=cores[k][2];
+          const dx=x-cx, dy=y-cy;
+          const d2=dx*dx+dy*dy;
+          const r2=(11 + peak*3.2) ** 2;
+          if (d2<r2){
+            const t=1-(d2/r2);
+            const v=t*peak;
+            if (v>tower) tower=v;
+          }
+        }
+
+        // canyon effect (walls next to corridors slightly lower)
+        const openN =
+          (world[idx(x+1,y)]===0) + (world[idx(x-1,y)]===0) +
+          (world[idx(x,y+1)]===0) + (world[idx(x,y-1)]===0);
+        const canyon = 1.0 - openN*0.14;
+
+        let h=(base + tower) * canyon;
+        h=Math.max(0.85, Math.min(7.5, h));
+        hmap[id]=h;
+      }
+    }
+
+    // Clear feedback when regenerating (avoid smear across worlds)
+    fbCtx.fillStyle="#050607"; fbCtx.fillRect(0,0,fbC.width,fbC.height);
+  }
+  genWorld();
+
+  // Controls
+  const keys=Object.create(null);
+
+  addEventListener('keydown', (e)=>{
+    keys[e.code]=true;
+    if (e.code==='KeyR') genWorld();
+    if (e.code==='KeyF') CFG.FEEDBACK_ON = !CFG.FEEDBACK_ON;
+    if (e.code==='KeyV') CFG.DIFF_ON = !CFG.DIFF_ON;
+    if (e.code==='KeyM') CFG.SUMI_ON = !CFG.SUMI_ON;
+    if (e.code==='KeyC') CFG.COLOR_MODE = (CFG.COLOR_MODE + 1) % 4;
+    if (e.code==='KeyL') CFG.OUTLINE_MODE = (CFG.OUTLINE_MODE + 1) % 3;
+    if (e.code==='KeyB'){
+      CFG.BILLBOARD_MODE = !CFG.BILLBOARD_MODE;
+      if (CFG.BILLBOARD_MODE){
+        CFG.QUANT_INDEX = Math.max(0, Math.min(CFG.QUANT_STEPS.length-1, CFG.QUANT_INDEX|0));
+        CFG.GLYPH_SCALE = CFG.QUANT_STEPS[CFG.QUANT_INDEX];
+        // keep billboard mode fast
+        CFG.SUMI_ON = false;
+      }
+    }
+    if (e.code==='Equal'){
+      if (CFG.BILLBOARD_MODE){
+        CFG.QUANT_INDEX = Math.min(CFG.QUANT_STEPS.length-1, CFG.QUANT_INDEX+1);
+        CFG.GLYPH_SCALE = CFG.QUANT_STEPS[CFG.QUANT_INDEX];
+        // keep billboard mode fast
+        CFG.SUMI_ON = false;
+      } else {
+        CFG.GLYPH_SCALE = Math.min(120.0, CFG.GLYPH_SCALE * 1.25);
+      }
+    }
+    if (e.code==='Minus'){
+      if (CFG.BILLBOARD_MODE){
+        CFG.QUANT_INDEX = Math.max(0, CFG.QUANT_INDEX-1);
+        CFG.GLYPH_SCALE = CFG.QUANT_STEPS[CFG.QUANT_INDEX];
+        // keep billboard mode fast
+        CFG.SUMI_ON = false;
+      } else {
+        CFG.GLYPH_SCALE = Math.max(0.05, CFG.GLYPH_SCALE / 1.25);
+      }
+    }
+
+  }, { passive:true });
+  addEventListener('keyup', (e)=>{ keys[e.code]=false; }, { passive:true });
+
+  cvs.addEventListener('click', ()=> cvs.requestPointerLock?.());
+  document.addEventListener('mousemove', (e)=>{
+    if (document.pointerLockElement!==cvs) return;
+    player.a += e.movementX * CFG.TURN_SENS;
+  }, { passive:true });
+
+  // Keyboard turning (mouse optional)
+  const TURN_KEY_SPEED = 1.6; // radians/sec
+
+  function tryMove(nx, ny){
+    const r=0.18;
+    const cx=nx|0, cy=ny|0;
+    for (let oy=-1; oy<=1; oy++){
+      for (let ox=-1; ox<=1; ox++){
+        const x=cx+ox, y=cy+oy;
+        if (!inb(x,y)) return;
+        if (world[idx(x,y)]===0) continue;
+        const minx=x, maxx=x+1, miny=y, maxy=y+1;
+        const px=Math.max(minx, Math.min(nx, maxx));
+        const py=Math.max(miny, Math.min(ny, maxy));
+        const dx=nx-px, dy=ny-py;
+        if (dx*dx+dy*dy < r*r) return;
+      }
+    }
+    player.x=nx; player.y=ny;
+  }
+
+  // Glyph sets
+  const G_WALL  = "田由冊皿凵凹凸囗回口日目井".split("");
+  const G_HARD  = "囗回口日目田凹凸冊井".split("");
+  const G_FLOOR = "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ゛゜・:;.,~".split("");
+  const G_CEIL  = "゜゛°·＊※ー".split("");
+
+  function glyphForWall(mat,x,y){
+    const n=(x*73856093 ^ y*19349663 ^ (mat*83492791))>>>0;
+    const set=(mat===2)?G_HARD:G_WALL;
+    return set[n%set.length];
+  }
+
+  // Tile cache (fast glyph stamping)
+  const tileCache=new Map();
+  const outlineTileCache=new Map();
+  const tilePad=2;
+
+  function clamp01(v){ return v<0?0:(v>1?1:v); }
+  function hsv2rgb(h,s,v){
+    h = ((h%1)+1)%1;
+    s = clamp01(s); v = clamp01(v);
+    const i = (h*6)|0;
+    const f = h*6 - i;
+    const p = v*(1-s);
+    const q = v*(1-f*s);
+    const t = v*(1-(1-f)*s);
+    let r,g,b;
+    switch(i%6){
+      case 0: r=v; g=t; b=p; break;
+      case 1: r=q; g=v; b=p; break;
+      case 2: r=p; g=v; b=t; break;
+      case 3: r=p; g=q; b=v; break;
+      case 4: r=t; g=p; b=v; break;
+      case 5: r=v; g=p; b=q; break;
+    }
+    return [(r*255)|0,(g*255)|0,(b*255)|0];
+  }
+
+  function fogFactor(dist){
+    if (dist<=CFG.FOG_START) return 1;
+    if (dist>=CFG.FOG_END) return 0;
+    const t=(dist-CFG.FOG_START)/(CFG.FOG_END-CFG.FOG_START);
+    return 1-t;
+  }
+
+  function makeTile(glyph, px, brightIdx, kind){
+    kind = kind || "wall";
+    const key=glyph+"|"+px+"|"+brightIdx+"|"+CFG.COLOR_MODE+"|"+kind;
+    const got=tileCache.get(key);
+    if (got) return got;
+
+    const s=px+tilePad*2;
+    const oc=document.createElement('canvas');
+    oc.width=s; oc.height=s;
+    const octx=oc.getContext('2d', { alpha:true });
+
+    const v=brightIdx/(CFG.BRIGHT_BUCKETS-1);
+
+    let r,g,b;
+    if (CFG.COLOR_MODE!==0){
+      // Vibrant fixed industrial palette -- separated by material kind
+      const PALETTE4 = [
+        [225,  6,  0],   // Signal Red  #E10600
+        [182,255,  0],   // Toxic Lime  #B6FF00
+        [  0,229,255],   // Cyan Flash #00E5FF
+        [255,211,  0],   // Sulphur Yellow #FFD300
+      ];
+      const PALETTE3 = [
+        [225,  6,  0],   // Signal Red — #E10600
+        [ 15, 15, 18],   // Charcoal Black — #0F0F12
+        [ 74, 26, 18],   // Oxide Brown — #4A1A12
+      ];
+      const PALETTE_HOT = [
+        [225,  6,  0],   // Signal Red      #E10600
+        [255, 30,138],   // Electric Magenta #FF1E8A
+        [255, 74, 28],   // Vermilion Orange #FF4A1C
+        [255,111, 97],   // Acid Coral       #FF6F61
+      ];
+      const PALETTE =
+        (CFG.COLOR_MODE===2) ? PALETTE3 :
+        (CFG.COLOR_MODE===3) ? PALETTE_HOT :
+        PALETTE4;
+      let k = 0.22 + v*0.92;
+      if (kind==="floor") k *= 0.62;
+      else if (kind==="ceil") k *= 0.45;
+      // walls unchanged
+
+      const code = glyph.codePointAt(0) || 0;
+      const add = (kind==="floor") ? 1 : (kind==="ceil" ? 3 : 0);
+      const idx = (code + brightIdx*3 + px + add) % PALETTE.length;
+      const p = PALETTE[idx];
+
+      r = (p[0] * k)|0;
+      g = (p[1] * k)|0;
+      b = (p[2] * k)|0;
+    } else {
+      if (kind==="floor"){
+        // warm, absorbent ground
+        r=(45 + v*190)|0;
+        g=(28 + v*130)|0;
+        b=(20 + v*70 )|0;
+      } else if (kind==="ceil"){
+        // dim violet haze
+        r=(30 + v*90 )|0;
+        g=(26 + v*60 )|0;
+        b=(55 + v*120)|0;
+      } else {
+        // wall: cool cyan
+        r=(55 + v*200)|0;
+        g=(110+ v*145)|0;
+        b=(160+ v*95 )|0;
+      }
+    }
+
+    octx.clearRect(0,0,s,s);
+    octx.textAlign='center';
+    octx.textBaseline='middle';
+    octx.font=`900 ${px}px ${CFG.FONT_FAMILY}`;
+
+    if (CFG.OUTLINE){
+      octx.lineWidth=Math.max(1, px*0.10);
+      octx.strokeStyle='rgba(0,0,0,0.85)';
+      octx.strokeText(glyph, s/2, s/2);
+    }
+    octx.fillStyle=`rgb(${r},${g},${b})`;
+    octx.fillText(glyph, s/2, s/2);
+
+    tileCache.set(key, oc);
+    return oc;
+  }
+
+  function makeOutlineTile(px){
+    const key = "O|"+px;
+    const got = outlineTileCache.get(key);
+    if (got) return got;
+
+    const s = px + tilePad*2;
+    const oc = document.createElement('canvas');
+    oc.width = s; oc.height = s;
+    const octx = oc.getContext('2d', { alpha:true });
+
+    octx.clearRect(0,0,s,s);
+    octx.textAlign='center';
+    octx.textBaseline='middle';
+    octx.font=`900 ${px}px ${CFG.FONT_FAMILY}`;
+
+    // "Loosely drawn" outline: a few jittered strokes in blue
+    const strokes = 3;
+    for (let i=0;i<strokes;i++){
+      const jx = (i===0?0: ( (i&1)?-1:1) ) * Math.max(0.6, px*0.03);
+      const jy = (i===0?0: ( (i&2)?-1:1) ) * Math.max(0.6, px*0.03);
+      octx.lineWidth = Math.max(1.2, px*0.10);
+      octx.strokeStyle = 'rgba(40,140,255,0.85)'; // loose blue
+      octx.strokeText('口', s/2 + jx, s/2 + jy);
+    }
+    // faint fill to help it read against bright walls
+    octx.fillStyle = 'rgba(40,140,255,0.12)';
+    octx.fillText('口', s/2, s/2);
+
+    outlineTileCache.set(key, oc);
+    return oc;
+  }
+
+  // DDA raycast
+  const EPS=1e-6;
+  function castRay(rx, ry, rdx, rdy, maxDist){
+    let mapX=rx|0, mapY=ry|0;
+
+    const invX = 1/(Math.abs(rdx)>EPS ? rdx : (rdx<0?-EPS:EPS));
+    const invY = 1/(Math.abs(rdy)>EPS ? rdy : (rdy<0?-EPS:EPS));
+    const deltaX=Math.abs(invX), deltaY=Math.abs(invY);
+
+    let stepX, stepY, sideDistX, sideDistY;
+
+    if (rdx<0){ stepX=-1; sideDistX=(rx-mapX)*deltaX; }
+    else      { stepX= 1; sideDistX=(mapX+1-rx)*deltaX; }
+
+    if (rdy<0){ stepY=-1; sideDistY=(ry-mapY)*deltaY; }
+    else      { stepY= 1; sideDistY=(mapY+1-ry)*deltaY; }
+
+    let side=0, mat=0;
+    for (let i=0;i<256;i++){
+      if (sideDistX<sideDistY){ sideDistX+=deltaX; mapX+=stepX; side=0; }
+      else { sideDistY+=deltaY; mapY+=stepY; side=1; }
+
+      if (!inb(mapX,mapY)){ mat=1; break; }
+      mat=world[idx(mapX,mapY)];
+      if (mat!==0) break;
+
+      const distNow = side ? (sideDistY-deltaY) : (sideDistX-deltaX);
+      if (distNow>maxDist) return null;
+    }
+
+    const dist = side ? (sideDistY-deltaY) : (sideDistX-deltaX);
+    if (!(dist>0 && dist<=maxDist)) return null;
+    return { dist, side, mat, hitX:mapX, hitY:mapY };
+  }
+
+  function buildFeedbackFromGlyphs(){
+    const w=fbC.width, h=fbC.height;
+
+    // persistence
+    fbCtx.save();
+    fbCtx.globalCompositeOperation="source-over";
+    fbCtx.globalAlpha=CFG.FB_PERSIST_ALPHA;
+    fbCtx.drawImage(fbC, CFG.FB_PERSIST_DX, CFG.FB_PERSIST_DY, w, h);
+    fbCtx.restore();
+
+    // inject glyph surface (scaled down)
+    fbCtx.save();
+    fbCtx.globalCompositeOperation="lighter";
+    fbCtx.globalAlpha=CFG.FB_INJECT_ALPHA;
+    fbCtx.drawImage(CFG.BILLBOARD_MODE ? gcProxy : gc, 0, 0, w, h);
+    fbCtx.restore();
+
+    // damping (avoid runaway brightness)
+    fbCtx.save();
+    fbCtx.globalCompositeOperation="multiply";
+    fbCtx.globalAlpha=CFG.FB_DAMP_ALPHA;
+    fbCtx.fillStyle=CFG.FB_DAMP_RGB;
+    fbCtx.fillRect(0,0,w,h);
+    fbCtx.restore();
+  }
+
+  function sampleFeedback(cols, rows){
+    // coarse sampling (cheap-ish). Toggle SUMI_ON if you can afford it.
+    const sw = Math.max(CFG.SUMI_SAMPLE_MIN_W, (cols/CFG.SUMI_SAMPLE_DIV)|0);
+    const sh = Math.max(CFG.SUMI_SAMPLE_MIN_H, (rows/CFG.SUMI_SAMPLE_DIV)|0);
+    try{
+      const img = fbCtx.getImageData(0,0, Math.min(sw, fbC.width), Math.min(sh, fbC.height));
+      return {img, sw:img.width, sh:img.height};
+    }catch(_){
+      return null;
+    }
+  }
+
+  function stampTile(targetCtx, tile, cxp, cyp, cellW, cellH, fbSample, gx, gy, cols, rows, outline){
+    // Fit in cell without overlap (disabled in BILLBOARD_MODE)
+    let dw, dh;
+    if (CFG.BILLBOARD_MODE){
+      // Pure billboards: draw at native tile size (already includes distance sizing + GLYPH_SCALE)
+      dw = tile.width;
+      dh = tile.height;
+    } else {
+      const maxFit = Math.min(cellW, cellH) * 0.98;
+      const scale = Math.min(1.0, maxFit / Math.max(tile.width, tile.height));
+      dw = tile.width * scale;
+      dh = tile.height * scale;
+    }
+
+    if (!CFG.SUMI_ON || !fbSample){
+      targetCtx.drawImage(tile, cxp - dw/2, cyp - dh/2, dw, dh);
+      if (outline){
+        const ot = makeOutlineTile(Math.max(10, (dw*0.95)|0));
+        targetCtx.save();
+        targetCtx.globalAlpha = 0.9;
+        targetCtx.drawImage(ot, cxp - ot.width/2, cyp - ot.height/2);
+        targetCtx.restore();
+      }
+      return;
+    }
+
+    // feedback-driven multi-pass: offsets are modulated by fb sample
+    const sx = Math.min(fbSample.sw-1, ((gx/cols)*fbSample.sw)|0);
+    const sy = Math.min(fbSample.sh-1, ((gy/rows)*fbSample.sh)|0);
+    const id = (sy*fbSample.sw + sx) * 4;
+    const rr = fbSample.img.data[id] / 255;
+    const gg = fbSample.img.data[id+1] / 255;
+    const bb = fbSample.img.data[id+2] / 255;
+    const lum = (rr+gg+bb)/3;
+
+    for (const p of CFG.SUMI_PASSES){
+      const ox = (rr-0.5) * cellW * p.s * (0.55+lum);
+      const oy = (gg-0.5) * cellH * p.s * (0.55+lum);
+      targetCtx.save();
+      targetCtx.globalAlpha = (0.60+lum) * p.a;
+      targetCtx.drawImage(tile, cxp - dw/2 + ox, cyp - dh/2 + oy, dw, dh);
+      targetCtx.restore();
+    }
+    if (outline){
+      const ot = makeOutlineTile(Math.max(10, (dw*0.95)|0));
+      targetCtx.save();
+      targetCtx.globalAlpha = 0.85;
+      targetCtx.drawImage(ot, cxp - ot.width/2, cyp - ot.height/2);
+      targetCtx.restore();
+    }
+    // restore alpha for caller safety
+    targetCtx.globalAlpha = 1;
+  }
+
+  function renderGlyphWorld(){
+    const cw=gc.width, ch=gc.height;
+
+    // Adaptive resolution: billboard mode can explode overdraw at huge scales,
+    // so we reduce grid density as scale increases (keeps FPS stable).
+    let cols = CFG.GRID_COLS;
+    if (CFG.BILLBOARD_MODE){
+      const s = Math.max(1, CFG.GLYPH_SCALE);
+      // inverse sqrt: 1x -> base cols, 4x -> /2, 16x -> /4, 64x -> /8
+      cols = Math.max(CFG.BILLBOARD_MIN_COLS, Math.min(CFG.BILLBOARD_BASE_COLS, (CFG.BILLBOARD_BASE_COLS / Math.sqrt(s))|0));
+      cols = Math.max(16, cols|0);
+    }
+    const rows = CFG.GRID_ROWS || Math.max(1, (cols*(ch/cw))|0);
+    const cellW = cw/cols, cellH = ch/rows;
+
+    const wallMask = new Uint8Array(cols*rows);
+
+    // clear glyph surface
+    gctx.fillStyle="#050607";
+    gctx.fillRect(0,0,cw,ch);
+
+    const fbSample = (CFG.SUMI_ON && CFG.FEEDBACK_ON) ? sampleFeedback(cols, rows) : null;
+
+    const fov=CFG.FOV;
+    const halfRows=rows*0.5;
+    const projPlane=(cols/(2*Math.tan(fov/2)))*CFG.PROJ_SCALE;
+
+    const xStep = (CFG.BILLBOARD_MODE ? Math.min(CFG.BILLBOARD_SKIP_MAX, Math.max(1, (Math.sqrt(Math.max(1,CFG.GLYPH_SCALE))|0))) : 1);
+    for (let gx=0; gx<cols; gx+=xStep){
+      const xN=(gx+0.5)/cols*2-1;
+      const rayA=player.a + xN*(fov*0.5);
+      const rdx=Math.cos(rayA), rdy=Math.sin(rayA);
+
+      const hit=castRay(player.x, player.y, rdx, rdy, CFG.MAX_DIST);
+      let isBoundary = false;
+      if (hit){
+        const hx=hit.hitX, hy=hit.hitY;
+        // boundary if adjacent to empty space (reads as building edge)
+        isBoundary =
+          (inb(hx+1,hy) && world[idx(hx+1,hy)]===0) ||
+          (inb(hx-1,hy) && world[idx(hx-1,hy)]===0) ||
+          (inb(hx,hy+1) && world[idx(hx,hy+1)]===0) ||
+          (inb(hx,hy-1) && world[idx(hx,hy-1)]===0);
+      }
+
+      let dist=CFG.MAX_DIST, side=0, wallGlyph=" ";
+      if (hit){
+        dist=hit.dist; side=hit.side;
+        wallGlyph=glyphForWall(hit.mat, hit.hitX, hit.hitY);
+      }
+
+      const cosCorr=Math.cos(rayA - player.a);
+      const pDist=Math.max(0.0001, dist*cosCorr);
+
+      const baseWallH=(projPlane/pDist);
+      let hFactor = 1.0;
+      if (hit){ hFactor = hmap[idx(hit.hitX, hit.hitY)] || 1.0; }
+      const wallH=Math.min(rows, (baseWallH * hFactor)|0);
+      const wallTop=(halfRows - wallH*0.5)|0;
+      const wallBot=(halfRows + wallH*0.5)|0;
+
+      const fog=fogFactor(pDist);
+      const dn=1-Math.min(1, pDist/CFG.MAX_DIST);
+
+      const sizeIdx=Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((Math.pow(dn,0.55))*(CFG.SIZE_BUCKETS-1))|0));
+      const px=((CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(sizeIdx/(CFG.SIZE_BUCKETS-1))) * CFG.GLYPH_SCALE)|0;
+
+      const sideShade=side?0.78:1.0;
+      const bN_wall=clamp01((0.15 + dn*0.95) * sideShade * fog);
+      const bIdx_wall=Math.max(0, Math.min(CFG.BRIGHT_BUCKETS-1, (bN_wall*(CFG.BRIGHT_BUCKETS-1))|0));
+      const wallTile = hit ? makeTile(wallGlyph, px, bIdx_wall, "wall") : null;
+
+      const yStep = (CFG.BILLBOARD_MODE ? Math.min(CFG.BILLBOARD_SKIP_MAX, Math.max(1, (Math.sqrt(Math.max(1,CFG.GLYPH_SCALE))|0))) : 1);
+      for (let gy=0; gy<rows; gy+=yStep){
+        const cxp=(gx + 0.5*xStep)*cellW;
+        const cyp=(gy + 0.5*yStep)*cellH;
+
+        let tile=null;
+
+        if (hit && gy>=wallTop && gy<=wallBot){
+          wallMask[gx + gy*cols] = 1;
+          const t=(wallH>0)?((gy-wallTop)/wallH):0;
+          let g=wallGlyph;
+          if (t<0.16) g="田"; else if (t<0.32) g=wallGlyph; else if (t<0.52) g=(((hit.hitX+hit.hitY)&1)?"日":"目"); else if (t<0.72) g=((((hit.hitX*3+hit.hitY*5)&3)===0)?"井":wallGlyph); else g=((((hit.hitX+hit.hitY)&3)===0)?"口":"凹");
+          tile=makeTile(g, px, bIdx_wall, "wall");
+        } else if (gy<wallTop){
+          const v=1-(gy/Math.max(1,wallTop+1));
+          const bN=clamp01((0.10+v*0.25)*fog);
+          const bIdx=(bN*(CFG.BRIGHT_BUCKETS-1))|0;
+          const glyph=G_CEIL[(gx+gy)&3];
+          const si=Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((0.15+v*0.10)*(CFG.SIZE_BUCKETS-1))|0));
+          const px2=((CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(si/(CFG.SIZE_BUCKETS-1))) * CFG.GLYPH_SCALE)|0;
+          tile=makeTile(glyph, px2, bIdx, "ceil");
+        } else {
+          const yN=(gy-halfRows)/halfRows;
+          const rowDist = projPlane / Math.max(0.001, yN*rows);
+          const fd=Math.min(CFG.MAX_DIST, rowDist);
+          const fog2=fogFactor(fd);
+          const dn2=1-Math.min(1, fd/CFG.MAX_DIST);
+          const bN=clamp01((0.10+dn2*0.55)*fog2);
+          const bIdx=(bN*(CFG.BRIGHT_BUCKETS-1))|0;
+          const glyph=G_FLOOR[(gx*3+gy*7)%G_FLOOR.length];
+          const si=Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((Math.pow(dn2,0.55))*(CFG.SIZE_BUCKETS-1))|0));
+          const px2=((CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(si/(CFG.SIZE_BUCKETS-1))) * CFG.GLYPH_SCALE)|0;
+          tile=makeTile(glyph, px2, bIdx, "floor");
+        }
+
+        const outline = (CFG.OUTLINE_MODE===1 && hit && isBoundary && gy>=wallTop && gy<=wallBot);
+        stampTile(gctx, tile, cxp, cyp, cellW, cellH, fbSample, gx, gy, cols, rows, outline);
+      }
+    }
+
+    // Crosshair glyph (keep crisp; no sumi)
+    {
+      const gx=(cols/2)|0, gy=(rows/2)|0;
+      const cxp=(gx+0.5)*cellW;
+      const cyp=(gy+0.5)*cellH;
+      const tile=makeTile("十", 14, CFG.BRIGHT_BUCKETS-1, "wall");
+      const maxFit=Math.min(cellW,cellH)*0.90;
+      const scale=Math.min(1.0, maxFit/Math.max(tile.width,tile.height));
+      const dw=tile.width*scale, dh=tile.height*scale;
+      gctx.globalAlpha=1;
+      gctx.drawImage(tile, cxp-dw/2, cyp-dh/2, dw, dh);
+    }
+
+    return { cols, rows, wallMask };
+  }
+
+  
+  function renderBuildingOutlineOverlay(wallMask, cols, rows, cellW, cellH){
+    // Draw a silhouette-style outline around contiguous wall masses visible in the current frame.
+    // Works at glyph-cell resolution (fast), and is rendered as a separate top layer (not diffed).
+    octxOutline.clearRect(0,0,ocOutline.width, ocOutline.height);
+    // Pre-make a few outline tiles for speed (fixed blue, different sizes)
+    const pxBase = 16;
+    const tile = makeOutlineTile(pxBase);
+
+    // Edge test: wall cell with any 4-neighbor non-wall => outline
+    for (let y=1; y<rows-1; y++){
+      const rowOff = y*cols;
+      for (let x=1; x<cols-1; x++){
+        const i = x + rowOff;
+        if (wallMask[i]!==1) continue;
+        if (wallMask[i-1]===1 && wallMask[i+1]===1 && wallMask[i-cols]===1 && wallMask[i+cols]===1) continue;
+
+        const cxp = (x+0.5)*cellW;
+        const cyp = (y+0.5)*cellH;
+
+        // Slight jitter per cell to feel loosely drawn but still coherent
+        const j = ((x*73856093) ^ (y*19349663)) >>> 0;
+        const jx = ((j & 255)/255 - 0.5) * Math.min(2.0, cellW*0.06);
+        const jy = (((j>>8) & 255)/255 - 0.5) * Math.min(2.0, cellH*0.06);
+
+        octxOutline.save();
+        octxOutline.globalAlpha = 0.92;
+        octxOutline.drawImage(tile, cxp - tile.width/2 + jx, cyp - tile.height/2 + jy);
+        octxOutline.restore();
+      }
+    }
+  }
+
+function composite(){
+    // primary: glyphs
+    ctx.globalCompositeOperation="source-over";
+    ctx.globalAlpha=1;
+    ctx.drawImage(gc, 0,0);
+
+    // difference: feedback (scaled up)
+    if (CFG.DIFF_ON && CFG.FEEDBACK_ON){
+      ctx.globalCompositeOperation="difference";
+      ctx.globalAlpha=CFG.DIFF_ALPHA;
+      ctx.imageSmoothingEnabled=false;
+      ctx.drawImage(fbC, 0,0, cvs.width, cvs.height);
+    }
+
+    // deepen blacks (multiply)
+    if (CFG.BLACKS_ON){
+      ctx.globalCompositeOperation="multiply";
+      ctx.globalAlpha=CFG.BLACKS_ALPHA;
+      ctx.fillStyle=CFG.BLACKS_RGB;
+      ctx.fillRect(0,0,cvs.width,cvs.height);
+    }
+
+    // restore
+    ctx.globalCompositeOperation="source-over";
+    ctx.globalAlpha=1;
+  }
+
+  // Main loop
+  let last=performance.now();
+  let smFps=60;
+
+  function frame(now){
+    const dt=Math.min(0.05,(now-last)/1000);
+    last=now;
+    const fps=dt>0?1/dt:60;
+    smFps=smFps*0.92 + fps*0.08;
+
+    // movement
+    const speed=CFG.MOVE_SPEED * ((keys.ShiftLeft||keys.ShiftRight)?CFG.SPRINT_MULT:1);
+    const ca=Math.cos(player.a), sa=Math.sin(player.a);
+    let mx=0,my=0;
+    if (keys.KeyW){ mx+=ca; my+=sa; }
+    if (keys.KeyS){ mx-=ca; my-=sa; }
+    if (keys.KeyA){ mx+= sa; my+=-ca; }
+    if (keys.KeyD){ mx+=-sa; my+= ca; }
+    const mlen=Math.hypot(mx,my);
+    if (mlen>1e-4){
+      mx/=mlen; my/=mlen;
+      tryMove(player.x + mx*speed*dt, player.y + my*speed*dt);
+    }
+    // keyboard turn
+    if (keys.KeyQ) player.a -= TURN_KEY_SPEED * dt;
+    if (keys.KeyE) player.a += TURN_KEY_SPEED * dt;
+
+
+    // 1) render glyph surface (depth raycaster)
+    let dims;
+    if (CFG.BILLBOARD_MODE){
+      // Two-pass in billboard mode:
+      //   pass A: render cell-fit (billboard OFF) into gc, copy to gcProxy for feedback
+      //   pass B: render billboard ON into gc for display
+      const _bb = CFG.BILLBOARD_MODE;
+      CFG.BILLBOARD_MODE = false;
+      dims = renderGlyphWorld();
+      gctxProxy.globalCompositeOperation = "source-over";
+      gctxProxy.globalAlpha = 1;
+      gctxProxy.drawImage(gc, 0, 0);
+      CFG.BILLBOARD_MODE = _bb;
+      dims = renderGlyphWorld();
+    } else {
+      dims = renderGlyphWorld();
+    }
+
+    // 2) update feedback from proxy (billboard mode) or from glyph surface
+    if (CFG.FEEDBACK_ON) buildFeedbackFromGlyphs();
+
+    // 3) composite primary image = DIFFERENCE(glyphs, feedback) + multiply deepen
+    composite();
+
+    // Outline mode 2: top-layer silhouette (not diffed)
+    if (CFG.OUTLINE_MODE===2 && dims && dims.wallMask){
+      const cw=gc.width, ch=gc.height;
+      const cols=dims.cols;
+      const rows=dims.rows;
+      const cellW=cw/cols, cellH=ch/rows;
+      renderBuildingOutlineOverlay(dims.wallMask, cols, rows, cellW, cellH);
+      ctx.globalCompositeOperation='source-over';
+      ctx.globalAlpha=1;
+      ctx.drawImage(ocOutline, 0,0);
+    }
+
+
+    const lock=(document.pointerLockElement===cvs)?"LOCK":"NOLOCK";
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
