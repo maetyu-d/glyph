@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Glyph FPS</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(()=>{
+const CFG={RES_SCALE:1,GRID_COLS:160,GRID_ROWS:0,FOV:Math.PI/3,MAX_DIST:32,MOVE_SPEED:3.3,SPRINT_MULT:1.65,TURN_SENS:0.0022,PROJ_SCALE:1.15,FONT_FAMILY:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Noto Sans Mono CJK JP", monospace',BASE_TILE_PX:22,MIN_TILE_PX:7,SIZE_BUCKETS:18,BRIGHT_BUCKETS:18,OUTLINE:true,FOG_START:8,FOG_END:30,FIRE_COOLDOWN:.16,HIT_DIST:24};
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d',{alpha:false,desynchronized:true});
+function resize(){canvas.width=Math.max(1,(innerWidth*CFG.RES_SCALE)|0);canvas.height=Math.max(1,(innerHeight*CFG.RES_SCALE)|0)}
+addEventListener('resize',resize,{passive:true});resize();
+const W=96,H=96,world=new Uint8Array(W*H),enemies=[],idx=(x,y)=>x+y*W,inb=(x,y)=>x>=0&&y>=0&&x<W&&y<H;
+let seed=0x12345678;
+const rand=()=>((seed^=seed<<13,seed^=seed>>>17,seed^=seed<<5)>>>0)/4294967296;
+function genWorld(){
+world.fill(0);enemies.length=0;
+for(let x=0;x<W;x++){world[idx(x,0)]=1;world[idx(x,H-1)]=1}
+for(let y=0;y<H;y++){world[idx(0,y)]=1;world[idx(W-1,y)]=1}
+for(let i=0;i<1700;i++){let x=2+(rand()*(W-4)|0),y=2+(rand()*(H-4)|0),w=1+(rand()*6|0),h=1+(rand()*6|0),t=1+(rand()*3|0);for(let yy=y;yy<y+h;yy++)for(let xx=x;xx<x+w;xx++)world[idx(xx,yy)]=t}
+for(let c=0;c<15;c++){let x=2+(rand()*(W-4)|0),y=2+(rand()*(H-4)|0),len=60+(rand()*110|0),dx=rand()<.5?1:0,dy=dx?0:1;if(rand()<.5){dx=-dx;dy=-dy}for(let i=0;i<len;i++){if(!inb(x,y))break;world[idx(x,y)]=0;if(rand()<.12&&inb(x+1,y))world[idx(x+1,y)]=0;if(rand()<.12&&inb(x,y+1))world[idx(x,y+1)]=0;if(rand()<.12){[dx,dy]=[-dy,dx];if(rand()<.5){dx=-dx;dy=-dy}}x+=dx;y+=dy}}for(let yy=7;yy<=14;yy++)for(let xx=7;xx<=14;xx++)if(inb(xx,yy))world[idx(xx,yy)]=0;
+for(let i=0;i<22;i++){let ex=6+(rand()*(W-12)|0)+.5,ey=6+(rand()*(H-12)|0)+.5,cx=ex|0,cy=ey|0;if(world[idx(cx,cy)]===0&&Math.hypot(ex-10.5,ey-10.5)>9)enemies.push({x:ex,y:ey,hp:2,t:rand()*10})}
+}
+genWorld();
+const player={x:10.5,y:10.5,a:.2},keys={};
+addEventListener('keydown',e=>{keys[e.code]=true;if(e.code==='KeyR')genWorld()},{passive:true});
+addEventListener('keyup',e=>keys[e.code]=false,{passive:true});
+canvas.addEventListener('click',()=>canvas.requestPointerLock?.());
+document.addEventListener('mousemove',e=>{if(document.pointerLockElement!==canvas)return;player.a+=e.movementX*CFG.TURN_SENS},{passive:true});
+function tryMove(nx,ny){
+const r=.18,cx=nx|0,cy=ny|0;
+for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){let x=cx+ox,y=cy+oy;if(!inb(x,y))return;if(world[idx(x,y)]!==0){let px=Math.max(x,Math.min(nx,x+1)),py=Math.max(y,Math.min(ny,y+1)),dx=nx-px,dy=ny-py;if(dx*dx+dy*dy<r*r)return}}
+player.x=nx;player.y=ny;
+}
+const G_WALL="山石木門寺鳥鬼龍雲森城塔柱壁影".split(""),G_HARD="口日目田凹凸回囗".split(""),G_FLOOR="々ゝゞヽヾー".split(""),G_CEIL="゜゛゜゛".split(""),G_ENEMY=["敵"];
+const glyphForWall=(m,x,y)=>{const s=m===2?G_HARD:G_WALL;return s[(x*73856093^y*19349663^(m*83492791))>>>0%s.length]};
+const tileCache=new Map(),tilePad=2,clamp01=v=>v<0?0:v>1?1:v,fogFactor=d=>d<=CFG.FOG_START?1:d>=CFG.FOG_END?0:1-(d-CFG.FOG_START)/(CFG.FOG_END-CFG.FOG_START);
+function makeTile(g,px,b){
+const k=g+"|"+px+"|"+b;if(tileCache.has(k))return tileCache.get(k);
+const s=px+tilePad*2,oc=document.createElement('canvas');oc.width=oc.height=s;
+const o=oc.getContext('2d'),v=b/(CFG.BRIGHT_BUCKETS-1);
+o.textAlign='center';o.textBaseline='middle';o.font=`900 ${px}px ${CFG.FONT_FAMILY}`;
+if(CFG.OUTLINE){o.lineWidth=Math.max(1,px*.1);o.strokeStyle='rgba(0,0,0,.85)';o.strokeText(g,s/2,s/2)}
+o.fillStyle=`rgb(${55+v*200|0},${110+v*145|0},${160+v*95|0})`;o.fillText(g,s/2,s/2);
+tileCache.set(k,oc);return oc;
+}
+const EPS=1e-6;
+function castRay(rx,ry,rdx,rdy,maxD){
+let mx=rx|0,my=ry|0,invX=1/(Math.abs(rdx)>EPS?rdx:EPS),invY=1/(Math.abs(rdy)>EPS?rdy:EPS),dx=Math.abs(invX),dy=Math.abs(invY),sx,sy,sdx,sdy;
+if(rdx<0){sx=-1;sdx=(rx-mx)*dx}else{sx=1;sdx=(mx+1-rx)*dx}
+if(rdy<0){sy=-1;sdy=(ry-my)*dy}else{sy=1;sdy=(my+1-ry)*dy}
+let side=0,mat=0;
+for(let i=0;i<256;i++){if(sdx<sdy){sdx+=dx;mx+=sx;side=0}else{sdy+=dy;my+=sy;side=1}
+if(!inb(mx,my)){mat=1;break}
+mat=world[idx(mx,my)];if(mat!==0)break;
+if((side?(sdy-dy):(sdx-dx))>maxD)return null}
+let dist=side?(sdy-dy):(sdx-dx);if(!(dist>0&&dist<=maxD))return null;
+return{dist,side,mat,x:mx,y:my}
+}
+let fireCooldown=0;
+addEventListener('mousedown',e=>{
+if(e.button!==0||document.pointerLockElement!==canvas||fireCooldown>0)return;
+fireCooldown=CFG.FIRE_COOLDOWN;
+const rdx=Math.cos(player.a),rdy=Math.sin(player.a);
+const hit=castRay(player.x,player.y,rdx,rdy,CFG.HIT_DIST);
+const wallD=hit?hit.dist:CFG.HIT_DIST;
+let best=-1,bestT=1e9;
+for(let i=0;i<enemies.length;i++){let en=enemies[i];if(en.hp<=0)continue;
+let ex=en.x-player.x,ey=en.y-player.y,t=ex*rdx+ey*rdy;
+if(t<=0||t>=wallD)continue;
+let px=ex-t*rdx,py=ey-t*rdy;
+if(px*px+py*py<=.28*.28&&t<bestT){bestT=t;best=i}}
+if(best>=0)enemies[best].hp--
+},{passive:true});
+let last=performance.now();
+function loop(t){
+const dt=Math.min(.05,(t-last)/1000);last=t;if(fireCooldown>0)fireCooldown-=dt;
+const speed=CFG.MOVE_SPEED*((keys.ShiftLeft||keys.ShiftRight)?CFG.SPRINT_MULT:1);
+const ca=Math.cos(player.a),sa=Math.sin(player.a);let mx=0,my=0;
+if(keys.KeyW){mx+=ca;my+=sa}if(keys.KeyS){mx-=ca;my-=sa}
+if(keys.KeyA||keys.KeyQ){mx+=-sa;my+=ca}if(keys.KeyD||keys.KeyE){mx+=sa;my+=-ca}
+let ml=Math.hypot(mx,my);if(ml>1e-4){mx/=ml;my/=ml;tryMove(player.x+mx*speed*dt,player.y+my*speed*dt)}
+for(let en of enemies)if(en.hp>0){en.t+=dt;
+let nx=en.x+Math.cos(en.t*.9)*.06*dt,ny=en.y+Math.sin(en.t*1.1)*.06*dt;
+if(inb(nx|0,ny|0)&&world[idx(nx|0,ny|0)]===0){en.x=nx;en.y=ny}}
+const cw=canvas.width,ch=canvas.height,cols=CFG.GRID_COLS,rows=CFG.GRID_ROWS||Math.max(1,(cols*(ch/cw))|0);
+const cellW=cw/cols,cellH=ch/rows;
+ctx.fillStyle="#000";ctx.fillRect(0,0,cw,ch);
+const zbuf=new Float32Array(cols).fill(CFG.MAX_DIST+1);
+const halfR=rows*.5,proj=(cols/(2*Math.tan(CFG.FOV/2)))*CFG.PROJ_SCALE;
+for(let gx=0;gx<cols;gx++){
+let xN=(gx+.5)/cols*2-1,a=player.a+xN*(CFG.FOV*.5);
+let rdx=Math.cos(a),rdy=Math.sin(a);
+let hit=castRay(player.x,player.y,rdx,rdy,CFG.MAX_DIST);
+let dist=CFG.MAX_DIST,side=0,mat=0,g=" ";
+if(hit){dist=hit.dist;side=hit.side;mat=hit.mat;g=glyphForWall(mat,hit.x,hit.y)}
+let pd=Math.max(.0001,dist*Math.cos(a-player.a));zbuf[gx]=pd;
+let h=Math.min(rows,(proj/pd)|0),top=(halfR-h*.5)|0,bot=(halfR+h*.5)|0;
+let fog=fogFactor(pd),dn=1-Math.min(1,pd/CFG.MAX_DIST);
+let si=((dn**.55)*(CFG.SIZE_BUCKETS-1))|0;
+let px=CFG.MIN_TILE_PX+(CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(si/(CFG.SIZE_BUCKETS-1))|0;
+let b=((.15+dn*.95)*(side?.78:1)*fog*(CFG.BRIGHT_BUCKETS-1))|0;
+let tile=makeTile(g,px,Math.max(0,Math.min(CFG.BRIGHT_BUCKETS-1,b)));
+for(let gy=0;gy<rows;gy++){
+let cx=(gx+.5)*cellW,cy=(gy+.5)*cellH,t2;
+if(gy>=top&&gy<=bot&&hit)t2=tile;
+else if(gy<top){
+let v=1-gy/Math.max(1,top+1),b2=((.1+v*.25)*fog*(CFG.BRIGHT_BUCKETS-1))|0;
+let px2=CFG.MIN_TILE_PX+(CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(.15+v*.1)|0;
+t2=makeTile(G_CEIL[(gx+gy)&3],px2,b2);
+}else{
+let yN=(gy-halfR)/halfR;
+let fd=Math.min(CFG.MAX_DIST,proj/Math.max(.001,yN*rows));
+let dn2=1-Math.min(1,fd/CFG.MAX_DIST);
+let b2=((.1+dn2*.55)*fogFactor(fd)*(CFG.BRIGHT_BUCKETS-1))|0;
+let px2=CFG.MIN_TILE_PX+(CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(dn2**.55)|0;
+t2=makeTile(G_FLOOR[(gx*3+gy*7)%G_FLOOR.length],px2,b2);
+}
+let fit=Math.min(cellW,cellH)*.98,sc=Math.min(1,fit/Math.max(t2.width,t2.height));
+ctx.drawImage(t2,cx-t2.width*sc/2,cy-t2.height*sc/2,t2.width*sc,t2.height*sc);
+}
+}
+for(let en of enemies)if(en.hp>0){
+let dx=en.x-player.x,dy=en.y-player.y,dist=Math.hypot(dx,dy);if(dist>CFG.MAX_DIST)continue;
+let ang=Math.atan2(dy,dx)-player.a;
+while(ang>Math.PI)ang-=Math.PI*2;while(ang<-Math.PI)ang+=Math.PI*2;
+if(Math.abs(ang)>CFG.FOV*.55)continue;
+let gx=((ang/(CFG.FOV*.5)*.5+.5)*cols)|0;if(gx<0||gx>=cols)continue;
+let pd=dist*Math.cos(ang);if(pd>=zbuf[gx])continue;
+let dn=1-Math.min(1,pd/CFG.MAX_DIST);
+let px=CFG.MIN_TILE_PX+(CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(dn**.55)|0;
+let b=((.25+dn*.85)*fogFactor(pd)*(CFG.BRIGHT_BUCKETS-1))|0;
+let tile=makeTile(G_ENEMY[0],px,b);
+let cx=(gx+.5)*cellW,cy=(halfR+.5)*cellH;
+let fit=Math.min(cellW,cellH)*.98,sc=Math.min(1,fit/Math.max(tile.width,tile.height));
+ctx.drawImage(tile,cx-tile.width*sc/2,cy-tile.height*sc/2,tile.width*sc,tile.height*sc);
+}
+{
+let gx=(cols/2)|0,gy=(rows/2)|0,cx=(gx+.5)*cellW,cy=(gy+.5)*cellH;
+let tile=makeTile("十",14,CFG.BRIGHT_BUCKETS-1);
+let fit=Math.min(cellW,cellH)*.9,sc=Math.min(1,fit/Math.max(tile.width,tile.height));
+ctx.drawImage(tile,cx-tile.width*sc/2,cy-tile.height*sc/2,tile.width*sc,tile.height*sc);
+}
+requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
