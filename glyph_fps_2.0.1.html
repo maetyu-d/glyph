@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Glyph FPS (Japanese) — depth-fixed</title>
+  <style>
+    html,body{margin:0;height:100%;background:#000;overflow:hidden;}
+    canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  // ============================================================
+  // Glyph FPS (Japanese) — classic column raycaster for real depth
+  //
+  // Key fix vs previous version:
+  // - We raycast PER COLUMN, compute projected wall height, and then
+  //   fill a glyph grid (each cell = one glyph space). This creates
+  //   unmistakable depth / perspective.
+  // - Glyph size is driven by depth (near walls draw larger glyph tiles).
+  // - Additional depth cues: fog, side shading, ceiling/floor gradients.
+  // ============================================================
+
+  const CFG = {
+    RES_SCALE: 1.0,
+
+    // One glyph per cell.
+    GRID_COLS: 160,
+    GRID_ROWS: 0, // derived from aspect if 0
+
+    // World + camera
+    FOV: Math.PI / 3.0,
+    MAX_DIST: 32,
+    MOVE_SPEED: 3.3,
+    SPRINT_MULT: 1.65,
+    TURN_SENS: 0.0022,
+
+    // Projection tuning (bigger = walls feel closer / taller)
+    PROJ_SCALE: 1.15,
+
+    // Glyph rendering
+    FONT_FAMILY: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Noto Sans Mono CJK JP", monospace',
+    BASE_TILE_PX: 22,
+    MIN_TILE_PX: 7,
+    SIZE_BUCKETS: 18,
+    BRIGHT_BUCKETS: 18,
+    OUTLINE: true,
+
+    // Depth cues
+    FOG_START: 8,
+    FOG_END: 30,
+
+    // Shooting (minimal)
+    FIRE_COOLDOWN: 0.16,
+    HIT_DIST: 24,
+  };
+
+  // Canvas
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+  function resize(){
+    canvas.width  = Math.max(1, (innerWidth  * CFG.RES_SCALE) | 0);
+    canvas.height = Math.max(1, (innerHeight * CFG.RES_SCALE) | 0);
+  }
+  addEventListener('resize', resize, { passive:true });
+  resize();
+
+  // World
+  const W=96, H=96;
+  const world = new Uint8Array(W*H);
+  const enemies = [];
+  function idx(x,y){ return x + y*W; }
+  function inb(x,y){ return x>=0 && y>=0 && x<W && y<H; }
+
+  // PRNG
+  let seed = 0x12345678;
+  function rand(){
+    seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+    return (seed >>> 0) / 4294967296;
+  }
+
+  function genWorld(){
+    world.fill(0);
+    enemies.length = 0;
+
+    for (let x=0;x<W;x++){ world[idx(x,0)]=1; world[idx(x,H-1)]=1; }
+    for (let y=0;y<H;y++){ world[idx(0,y)]=1; world[idx(W-1,y)]=1; }
+
+    for (let i=0;i<1700;i++){
+      const x = 2 + (rand()*(W-4)|0);
+      const y = 2 + (rand()*(H-4)|0);
+      const w = 1 + (rand()*6|0);
+      const h = 1 + (rand()*6|0);
+      const t = 1 + (rand()*3|0);
+      for (let yy=y; yy<y+h; yy++) for (let xx=x; xx<x+w; xx++) world[idx(xx,yy)] = t;
+    }
+
+    for (let c=0;c<15;c++){
+      let x = 2 + (rand()*(W-4)|0);
+      let y = 2 + (rand()*(H-4)|0);
+      const len = 60 + (rand()*110|0);
+      let dx = rand()<0.5 ? 1 : 0;
+      let dy = dx ? 0 : 1;
+      if (rand()<0.5) { dx=-dx; dy=-dy; }
+      for (let i=0;i<len;i++){
+        if (!inb(x,y)) break;
+        world[idx(x,y)] = 0;
+        if (rand()<0.12 && inb(x+1,y)) world[idx(x+1,y)] = 0;
+        if (rand()<0.12 && inb(x,y+1)) world[idx(x,y+1)] = 0;
+        if (rand()<0.12){
+          const tmp=dx; dx=-dy; dy=tmp;
+          if (rand()<0.5){ dx=-dx; dy=-dy; }
+        }
+        x+=dx; y+=dy;
+      }
+    }
+
+    // spawn clearing near (10.5,10.5)
+    for (let yy=7; yy<=14; yy++) for (let xx=7; xx<=14; xx++) if (inb(xx,yy)) world[idx(xx,yy)] = 0;
+
+    // enemies
+    for (let i=0;i<22;i++){
+      const ex = 6 + (rand()*(W-12)|0) + 0.5;
+      const ey = 6 + (rand()*(H-12)|0) + 0.5;
+      const cx=ex|0, cy=ey|0;
+      if (world[idx(cx,cy)]===0 && Math.hypot(ex-10.5,ey-10.5)>9){
+        enemies.push({x:ex,y:ey,hp:2,t:rand()*10});
+      }
+    }
+  }
+  genWorld();
+
+  // Controls
+  const player = { x:10.5, y:10.5, a:0.2 };
+  const keys = Object.create(null);
+
+  addEventListener('keydown', (e)=>{ keys[e.code]=true; if (e.code==='KeyR') genWorld(); }, { passive:true });
+  addEventListener('keyup', (e)=>{ keys[e.code]=false; }, { passive:true });
+
+  canvas.addEventListener('click', ()=> canvas.requestPointerLock?.());
+  document.addEventListener('mousemove', (e)=>{
+    if (document.pointerLockElement !== canvas) return;
+    player.a += e.movementX * CFG.TURN_SENS;
+  }, { passive:true });
+
+  function tryMove(nx, ny){
+    const r=0.18;
+    const cx=nx|0, cy=ny|0;
+    for (let oy=-1; oy<=1; oy++){
+      for (let ox=-1; ox<=1; ox++){
+        const x=cx+ox, y=cy+oy;
+        if (!inb(x,y)) return;
+        if (world[idx(x,y)]===0) continue;
+        const minx=x, maxx=x+1, miny=y, maxy=y+1;
+        const px=Math.max(minx, Math.min(nx, maxx));
+        const py=Math.max(miny, Math.min(ny, maxy));
+        const dx=nx-px, dy=ny-py;
+        if (dx*dx+dy*dy < r*r) return;
+      }
+    }
+    player.x=nx; player.y=ny;
+  }
+
+  // Glyph sets
+  const G_WALL  = "山石木門寺鳥鬼龍雲森城塔柱壁影".split("");
+  const G_HARD  = "口日目田凹凸回囗".split("");
+  const G_AIR   = "・｡､ﾟ:;".split("");
+  const G_FLOOR = "々ゝゞヽヾー".split("");
+  const G_CEIL  = "゜゛゜゛".split("");
+  const G_ENEMY = "敵".split("");
+
+  function glyphForWall(mat,x,y){
+    const n=(x*73856093 ^ y*19349663 ^ (mat*83492791))>>>0;
+    const set=(mat===2)?G_HARD:G_WALL;
+    return set[n%set.length];
+  }
+
+  // Tile cache
+  const tileCache = new Map();
+  const tilePad = 2;
+  function clamp01(v){ return v<0?0:(v>1?1:v); }
+
+  function fogFactor(dist){
+    if (dist<=CFG.FOG_START) return 1;
+    if (dist>=CFG.FOG_END) return 0;
+    const t=(dist-CFG.FOG_START)/(CFG.FOG_END-CFG.FOG_START);
+    return 1 - t;
+  }
+
+  function makeTile(glyph, px, brightIdx){
+    const key=glyph+"|"+px+"|"+brightIdx;
+    const got=tileCache.get(key);
+    if (got) return got;
+
+    const s=px+tilePad*2;
+    const oc=document.createElement('canvas');
+    oc.width=s; oc.height=s;
+    const octx=oc.getContext('2d', { alpha:true });
+
+    const v=brightIdx/(CFG.BRIGHT_BUCKETS-1);
+    // cold cyan -> white, but keep contrast
+    const r=(55 + v*200)|0;
+    const g=(110 + v*145)|0;
+    const b=(160 + v*95 )|0;
+
+    octx.clearRect(0,0,s,s);
+    octx.textAlign='center';
+    octx.textBaseline='middle';
+    octx.font=`900 ${px}px ${CFG.FONT_FAMILY}`;
+
+    if (CFG.OUTLINE){
+      octx.lineWidth=Math.max(1, px*0.10);
+      octx.strokeStyle='rgba(0,0,0,0.85)';
+      octx.strokeText(glyph, s/2, s/2);
+    }
+    octx.fillStyle=`rgb(${r},${g},${b})`;
+    octx.fillText(glyph, s/2, s/2);
+
+    tileCache.set(key, oc);
+    return oc;
+  }
+
+  (function warm(){
+    const glyphs=[...new Set([...G_WALL,...G_HARD,...G_AIR,...G_FLOOR,...G_CEIL,...G_ENEMY,"十"," "])];
+    for (const g of glyphs){
+      for (let si=0; si<CFG.SIZE_BUCKETS; si++){
+        const px=(CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(si/(CFG.SIZE_BUCKETS-1)))|0;
+        for (let bi=0; bi<CFG.BRIGHT_BUCKETS; bi+=2) makeTile(g, px, bi);
+      }
+    }
+  })();
+
+  // DDA raycast returning perpendicular distance + side/material
+  const EPS = 1e-6;
+  function castRay(rx, ry, rdx, rdy, maxDist){
+    let mapX=rx|0, mapY=ry|0;
+
+    const invX = 1/ (Math.abs(rdx)>EPS ? rdx : (rdx<0?-EPS:EPS));
+    const invY = 1/ (Math.abs(rdy)>EPS ? rdy : (rdy<0?-EPS:EPS));
+    const deltaX=Math.abs(invX), deltaY=Math.abs(invY);
+
+    let stepX, stepY, sideDistX, sideDistY;
+
+    if (rdx<0){ stepX=-1; sideDistX=(rx-mapX)*deltaX; }
+    else      { stepX= 1; sideDistX=(mapX+1-rx)*deltaX; }
+
+    if (rdy<0){ stepY=-1; sideDistY=(ry-mapY)*deltaY; }
+    else      { stepY= 1; sideDistY=(mapY+1-ry)*deltaY; }
+
+    let side=0, mat=0;
+    for (let i=0;i<256;i++){
+      if (sideDistX<sideDistY){ sideDistX+=deltaX; mapX+=stepX; side=0; }
+      else { sideDistY+=deltaY; mapY+=stepY; side=1; }
+
+      if (!inb(mapX,mapY)){ mat=1; break; }
+      mat=world[idx(mapX,mapY)];
+      if (mat!==0) break;
+
+      const distNow = side ? (sideDistY-deltaY) : (sideDistX-deltaX);
+      if (distNow>maxDist) return null;
+    }
+
+    // perpendicular distance (fix fish-eye by using the DDA computed dist already)
+    const dist = side ? (sideDistY-deltaY) : (sideDistX-deltaX);
+    if (!(dist>0 && dist<=maxDist)) return null;
+
+    return { dist, side, mat, hitX:mapX, hitY:mapY };
+  }
+
+  // Shooting
+  let fireCooldown=0;
+  addEventListener('mousedown', (e)=>{
+    if (e.button!==0) return;
+    if (document.pointerLockElement!==canvas) return;
+    if (fireCooldown>0) return;
+
+    fireCooldown=CFG.FIRE_COOLDOWN;
+
+    const rdx=Math.cos(player.a), rdy=Math.sin(player.a);
+    const wallHit=castRay(player.x, player.y, rdx, rdy, CFG.HIT_DIST);
+    const wallD=wallHit?wallHit.dist:CFG.HIT_DIST;
+
+    let best=-1, bestT=1e9;
+    for (let i=0;i<enemies.length;i++){
+      const en=enemies[i];
+      if (en.hp<=0) continue;
+      const ex=en.x-player.x, ey=en.y-player.y;
+      const t=ex*rdx + ey*rdy;
+      if (t<=0 || t>=wallD) continue;
+      const px=ex-t*rdx, py=ey-t*rdy;
+      const d2=px*px+py*py;
+      const rad=0.28;
+      if (d2<=rad*rad && t<bestT){ bestT=t; best=i; }
+    }
+    if (best>=0) enemies[best].hp -= 1;
+  }, { passive:true });
+
+  // Main loop
+  let lastT=performance.now();
+  let fpsAcc=0, fpsN=0, fps=0;
+
+  function loop(t){
+    const dt=Math.min(0.05, (t-lastT)/1000);
+    lastT=t;
+    if (fireCooldown>0) fireCooldown-=dt;
+
+    // Move
+    const speed=CFG.MOVE_SPEED * ((keys.ShiftLeft||keys.ShiftRight)?CFG.SPRINT_MULT:1);
+    const ca=Math.cos(player.a), sa=Math.sin(player.a);
+    let mx=0,my=0;
+    if (keys.KeyW){ mx+=ca; my+=sa; }
+    if (keys.KeyS){ mx-=ca; my-=sa; }
+    if (keys.KeyA||keys.KeyQ){ mx+=-sa; my+=ca; }
+    if (keys.KeyD||keys.KeyE){ mx+= sa; my+=-ca; }
+    const mlen=Math.hypot(mx,my);
+    if (mlen>1e-4){
+      mx/=mlen; my/=mlen;
+      tryMove(player.x + mx*speed*dt, player.y + my*speed*dt);
+    }
+
+    // Enemy idle drift (tiny)
+    for (let i=0;i<enemies.length;i++){
+      const en=enemies[i];
+      if (en.hp<=0) continue;
+      en.t += dt;
+      const wob=0.06;
+      const nx=en.x + Math.cos(en.t*0.9+i)*wob*dt;
+      const ny=en.y + Math.sin(en.t*1.1+i)*wob*dt;
+      const cx=nx|0, cy=ny|0;
+      if (inb(cx,cy) && world[idx(cx,cy)]===0){ en.x=nx; en.y=ny; }
+    }
+
+    const cw=canvas.width, ch=canvas.height;
+    const cols=CFG.GRID_COLS;
+    const rows=CFG.GRID_ROWS || Math.max(1, (cols*(ch/cw))|0);
+    const cellW=cw/cols, cellH=ch/rows;
+
+    // Clear
+    ctx.fillStyle="#000";
+    ctx.fillRect(0,0,cw,ch);
+
+    const zbuf = new Float32Array(cols);
+    zbuf.fill(CFG.MAX_DIST+1);
+
+    // Raycast per column + fill cells based on wall slice
+    const fov=CFG.FOV;
+    const halfRows = rows*0.5;
+    const projPlane = (cols / (2*Math.tan(fov/2))) * CFG.PROJ_SCALE; // in "cell units"
+
+    for (let gx=0; gx<cols; gx++){
+      const xN = (gx + 0.5)/cols * 2 - 1;          // -1..1
+      const rayA = player.a + xN*(fov*0.5);
+      const rdx = Math.cos(rayA), rdy = Math.sin(rayA);
+
+      const hit = castRay(player.x, player.y, rdx, rdy, CFG.MAX_DIST);
+
+      let dist = CFG.MAX_DIST;
+      let side = 0;
+      let mat = 0;
+      let wallGlyph = " ";
+      if (hit){
+        dist = hit.dist;
+        side = hit.side;
+        mat = hit.mat;
+        wallGlyph = glyphForWall(mat, hit.hitX, hit.hitY);
+      }
+
+      // Fish-eye correction: use cosine between ray and view direction
+      const cosCorr = Math.cos(rayA - player.a);
+      const pDist = Math.max(0.0001, dist * cosCorr);
+
+      zbuf[gx] = pDist;
+
+      // Projected wall height in glyph cells
+      const wallH = Math.min(rows, (projPlane / pDist) | 0);
+      const wallTop = (halfRows - wallH*0.5) | 0;
+      const wallBot = (halfRows + wallH*0.5) | 0;
+
+      // Brightness: distance + side shade + fog
+      const fog = fogFactor(pDist);
+      const dn = 1 - Math.min(1, pDist / CFG.MAX_DIST);
+
+      // Stronger near-size scaling (makes depth pop)
+      const sizeIdx = Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((Math.pow(dn, 0.55)) * (CFG.SIZE_BUCKETS-1)) | 0));
+      const px = (CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(sizeIdx/(CFG.SIZE_BUCKETS-1))) | 0;
+
+      const sideShade = side ? 0.78 : 1.0;
+      const bN_wall = clamp01((0.15 + dn*0.95) * sideShade * fog);
+      const bIdx_wall = Math.max(0, Math.min(CFG.BRIGHT_BUCKETS-1, (bN_wall*(CFG.BRIGHT_BUCKETS-1))|0));
+      const wallTile = makeTile(wallGlyph, px, bIdx_wall);
+
+      // Draw column as glyph cells (each cell one draw)
+      for (let gy=0; gy<rows; gy++){
+        const cxp = (gx + 0.5) * cellW;
+        const cyp = (gy + 0.5) * cellH;
+
+        let glyph = " ";
+        let bIdx = 0;
+        let tile = null;
+
+        if (gy >= wallTop && gy <= wallBot && hit){
+          tile = wallTile; // same wall glyph per cell; size encodes depth
+        } else if (gy < wallTop) {
+          // Ceiling: subtle gradient + fog (gives vertical depth)
+          const v = 1 - (gy / Math.max(1, wallTop+1));
+          const bN = clamp01((0.10 + v*0.25) * fog);
+          bIdx = (bN*(CFG.BRIGHT_BUCKETS-1))|0;
+          glyph = G_CEIL[(gx + gy) & 3];
+          const si = Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((0.15 + v*0.1) * (CFG.SIZE_BUCKETS-1))|0));
+          const px2 = (CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(si/(CFG.SIZE_BUCKETS-1)))|0;
+          tile = makeTile(glyph, px2, bIdx);
+        } else {
+          // Floor: use "row distance" approximation (classic raycaster)
+          const yN = (gy - halfRows) / halfRows; // 0..1 below horizon
+          const rowDist = (projPlane / Math.max(0.001, yN*rows)) ; // not perfect but strong cue
+          const fd = Math.min(CFG.MAX_DIST, rowDist);
+          const fog2 = fogFactor(fd);
+          const dn2 = 1 - Math.min(1, fd / CFG.MAX_DIST);
+          const bN = clamp01((0.10 + dn2*0.55) * fog2);
+          bIdx = (bN*(CFG.BRIGHT_BUCKETS-1))|0;
+          glyph = G_FLOOR[(gx*3 + gy*7) % G_FLOOR.length];
+          const si = Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((Math.pow(dn2, 0.55))*(CFG.SIZE_BUCKETS-1))|0));
+          const px2 = (CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(si/(CFG.SIZE_BUCKETS-1)))|0;
+          tile = makeTile(glyph, px2, bIdx);
+        }
+
+        // Fit in cell without overlap
+        const maxFit = Math.min(cellW, cellH) * 0.98;
+        const scale = Math.min(1.0, maxFit / Math.max(tile.width, tile.height));
+        const dw = tile.width * scale, dh = tile.height * scale;
+        ctx.drawImage(tile, cxp - dw/2, cyp - dh/2, dw, dh);
+      }
+    }
+
+    // Enemy sprites: project to column and draw into one cell near horizon
+    const halfCols = cols * 0.5;
+    for (let i=0;i<enemies.length;i++){
+      const en=enemies[i];
+      if (en.hp<=0) continue;
+
+      const dx=en.x-player.x, dy=en.y-player.y;
+      const dist=Math.hypot(dx,dy);
+      if (dist>CFG.MAX_DIST) continue;
+
+      let ang = Math.atan2(dy,dx) - player.a;
+      while (ang> Math.PI) ang-=Math.PI*2;
+      while (ang<-Math.PI) ang+=Math.PI*2;
+      if (Math.abs(ang) > fov*0.55) continue;
+
+      const xN = ang / (fov*0.5);               // -1..1
+      const gx = ((xN*0.5 + 0.5) * cols) | 0;
+      if (gx<0||gx>=cols) continue;
+
+      // depth test against wall
+      const pDist = dist * Math.cos(ang);
+      if (pDist >= zbuf[gx]) continue;
+
+      // pick a row around horizon; slight bob with distance
+      const wallH = Math.min(rows, (projPlane / Math.max(0.0001,pDist))|0);
+      const gy = (halfRows | 0); // centered
+      // size/brightness
+      const dn = 1 - Math.min(1, pDist/CFG.MAX_DIST);
+      const fog = fogFactor(pDist);
+      const sizeIdx = Math.max(0, Math.min(CFG.SIZE_BUCKETS-1, ((Math.pow(dn,0.55))*(CFG.SIZE_BUCKETS-1))|0));
+      const px = (CFG.MIN_TILE_PX + (CFG.BASE_TILE_PX-CFG.MIN_TILE_PX)*(sizeIdx/(CFG.SIZE_BUCKETS-1)))|0;
+      const bN = clamp01((0.25 + dn*0.85)*fog);
+      const bIdx = (bN*(CFG.BRIGHT_BUCKETS-1))|0;
+
+      const tile = makeTile(G_ENEMY[0], px, bIdx);
+      const cxp = (gx+0.5)*cellW;
+      const cyp = (gy+0.5)*cellH;
+
+      const maxFit = Math.min(cellW, cellH)*0.98;
+      const scale = Math.min(1.0, maxFit/Math.max(tile.width,tile.height));
+      const dw=tile.width*scale, dh=tile.height*scale;
+      ctx.drawImage(tile, cxp-dw/2, cyp-dh/2, dw, dh);
+    }
+
+    // Crosshair glyph at center cell
+    {
+      const gx=(cols/2)|0, gy=(rows/2)|0;
+      const cxp=(gx+0.5)*cellW, cyp=(gy+0.5)*cellH;
+      const tile=makeTile("十", 14, CFG.BRIGHT_BUCKETS-1);
+      const maxFit=Math.min(cellW,cellH)*0.90;
+      const scale=Math.min(1.0, maxFit/Math.max(tile.width,tile.height));
+      const dw=tile.width*scale, dh=tile.height*scale;
+      ctx.drawImage(tile, cxp-dw/2, cyp-dh/2, dw, dh);
+    }
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
