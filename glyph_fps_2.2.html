@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Glyph FPS (Japanese) — DEPTH + DIFF(feedback,glyphs)</title>
+  <title>Glyph FPS</title>
   <style>
     html,body{margin:0;height:100%;background:#050607;overflow:hidden;}
     canvas{display:block;width:100vw;height:100vh;image-rendering:pixelated;}
@@ -14,24 +14,6 @@
 
 <script>
 (() => {
-  // ============================================================
-  // LIFTED PIPELINE (from your previous project):
-  //
-  // 1) Render crisp glyph world into offscreen "gc" (full-res)
-  // 2) Build low-res feedback buffer "fbC" from gc:
-  //    - persistence: fbC draws itself with drift + alpha
-  //    - inject: draw gc into fbC with "lighter" alpha
-  //    - damping: multiply dark fill to prevent runaway
-  // 3) Primary image on screen:
-  //    ctx.drawImage(gc)
-  //    ctx.globalCompositeOperation="difference"
-  //    ctx.drawImage(fbC, scaled up)
-  //    ctx.globalCompositeOperation="multiply" (deepen blacks)
-  //
-  // This is NOT frame-to-frame diff. It's DIFF(glyphs, feedback).
-  //
-  // Extra (optional): "sumi multi-pass" glyph stamping modulated by a
-  // coarse sample of fbC. Toggle with M. Default OFF for performance.
   // ============================================================
 
   const CFG = {
@@ -49,7 +31,7 @@
     TURN_SENS: 0.0022,
     PROJ_SCALE: 1.15,
 
-    // Glyph tile sizing (still respects distance, but we're drawing as tiles within cells)
+    // Glyph tile sizing (still respects distance, but draws as tiles within cells)
     FONT_FAMILY: 'ui-monospace, "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP", Menlo, Monaco, Consolas, monospace',
     BASE_TILE_PX: 22,
     GLYPH_SCALE: 1.0,
