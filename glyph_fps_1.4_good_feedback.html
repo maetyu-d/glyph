@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>縦列ルビFPS — DIFF+SUMI (VISIBLE)</title>
+<style>
+  html,body{margin:0;height:100%;background:#050607;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:fixed;left:10px;top:10px;z-index:10;font:12px/1.25 ui-monospace;color:#d6f0ff;white-space:pre;pointer-events:none;text-shadow:0 1px 0 rgba(0,0,0,.35)}
+  #overlay{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.75);color:#eaf6ff;font:14px/1.45 ui-monospace;text-align:center;padding:24px;user-select:none}
+  #overlay .box{max-width:980px;padding:18px 18px;border:1px solid rgba(255,255,255,.22);border-radius:12px;background:rgba(10,12,14,.86);box-shadow:0 10px 30px rgba(0,0,0,.45)}
+  .kbd{display:inline-block;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);margin:0 2px}
+  button{margin-top:14px;padding:12px 16px;font:14px ui-monospace;cursor:pointer;border-radius:10px;border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.10);color:#eaf6ff}
+  button:hover{background:rgba(255,255,255,.14)}
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<canvas id="c"></canvas>
+<div id="overlay"><div class="box">
+  <b>DIFF + SUMI (glyphs must be visible)</b><br><br>
+  This build renders glyphs to an offscreen surface, builds feedback from that surface, then makes the <b>primary image</b> the <b>DIFFERENCE</b> between glyphs and feedback.<br><br>
+  Look: <span class="kbd">mouse</span> · Move: <span class="kbd">W</span><span class="kbd">S</span> · Strafe: <span class="kbd">Q</span><span class="kbd">E</span> · Resize: <span class="kbd">-</span>/<span class="kbd">=</span> · Furigana mode: <span class="kbd">R</span><br>
+  <button id="startBtn">START</button>
+</div></div>
+
+<script>
+(() => {
+  const cvs = document.getElementById("c");
+  const ctx = cvs.getContext("2d", {alpha:false});
+
+  // Offscreen glyph surface (the "real" world material)
+  const gc = document.createElement("canvas");
+  const gctx = gc.getContext("2d", {alpha:true});
+
+  // Feedback buffer (low-res, built from glyph surface)
+  const fbC = document.createElement("canvas");
+  const fbCtx = fbC.getContext("2d", {alpha:true});
+
+  const hud = document.getElementById("hud");
+  const overlay = document.getElementById("overlay");
+  const startBtn = document.getElementById("startBtn");
+
+  /* ===== world ===== */
+  const MAP_W=28, MAP_H=28;
+  const MAP = Array.from({length: MAP_H}, (_, y) =>
+    Array.from({length: MAP_W}, (_, x) =>
+      (x===0||y===0||x===MAP_W-1||y===MAP_H-1) ? 1 : 0
+    )
+  );
+  for (let y=4; y<24; y++) MAP[y][8] = 2;
+  for (let y=4; y<24; y++) MAP[y][19] = 3;
+  for (let x=10; x<18; x++) MAP[14][x] = 4;
+
+  const MAT = {
+    1:{g:"壁", r:"いし", base:[196,215,255]},
+    2:{g:"柱", r:"もく", base:[255,210,160]},
+    3:{g:"鉄", r:"てつ", base:[190,255,220]},
+    4:{g:"門", r:"もん", base:[255,190,240]},
+  };
+
+  /* ===== math ===== */
+  const clamp01 = (t)=> t<0?0:(t>1?1:t);
+  const lerp = (a,b,t)=> a+(b-a)*t;
+  function rgb(arr, a=1){
+    return a>=1 ? `rgb(${arr[0]|0},${arr[1]|0},${arr[2]|0})`
+                : `rgba(${arr[0]|0},${arr[1]|0},${arr[2]|0},${a})`;
+  }
+  function shadeRGB(base, dNorm){
+    const d = 1 - 0.78*dNorm;
+    return [(base[0]*d)|0,(base[1]*d)|0,(base[2]*d)|0];
+  }
+
+  /* ===== raycast ===== */
+  const FOV = Math.PI/3;
+  const FAR = 18;
+  const STEP = 0.095;
+  let px=4.5, py=4.5;
+  let pa=0, paTarget=0;
+
+  function isWall(x,y){
+    const ix=x|0, iy=y|0;
+    if(ix<0||iy<0||ix>=MAP_W||iy>=MAP_H) return 1;
+    return MAP[iy][ix];
+  }
+  function castRay(a){
+    let d=0;
+    const dx=Math.cos(a), dy=Math.sin(a);
+    while(d<FAR){
+      const hx=px+dx*d, hy=py+dy*d;
+      const m=isWall(hx,hy);
+      if(m) return {d,mat:m, hx, hy};
+      d+=STEP;
+    }
+    return {d:FAR,mat:0, hx:px+Math.cos(a)*FAR, hy:py+Math.sin(a)*FAR};
+  }
+
+  /* ===== input ===== */
+  let started=false, locked=false;
+  const keys=new Set();
+  let modeRail=false;
+
+  function startGame(){
+    if (started) return;
+    started=true;
+    overlay.style.display="none";
+    try{ cvs.requestPointerLock?.(); }catch(_){}
+    paTarget = pa;
+  }
+  startBtn.addEventListener("click",(e)=>{ e.preventDefault(); startGame(); });
+  overlay.addEventListener("click",(e)=>{ if(e.target!==startBtn) startGame(); });
+
+  document.addEventListener("pointerlockchange", ()=> locked = (document.pointerLockElement === cvs));
+  document.addEventListener("mousemove",(e)=>{
+    if(!locked) return;
+    paTarget += e.movementX * 0.00125; // slower look
+  });
+  window.addEventListener("keydown",(e)=>{
+    const k=e.key.toLowerCase();
+    keys.add(k);
+    if(k==="r") modeRail=!modeRail;
+    if(e.key==="="){ scale=Math.min(2.75,+(scale+0.10).toFixed(2)); recomputeLayout(); }
+    if(e.key==="-"){ scale=Math.max(0.50,+(scale-0.10).toFixed(2)); recomputeLayout(); }
+  });
+  window.addEventListener("keyup",(e)=> keys.delete(e.key.toLowerCase()));
+  function tryMove(nx,ny){
+    const r=0.18;
+    if (isWall(nx+r,ny)===0 && isWall(nx-r,ny)===0 && isWall(nx,ny+r)===0 && isWall(nx,ny-r)===0){
+      px=nx; py=ny;
+    }
+  }
+
+  /* ===== layout ===== */
+  const BASE={ cellW:20, cellH:44, rb:28, rt:16, rail:12 };
+  let scale=1.0;
+  let cellW=20, cellH=44, rbSize=28, rtSize=16, railW=12;
+  let COLS=0, ROWS=0, camX=[];
+
+  function drawVerticalKana(c, text, x, yTop, height, alpha){
+    c.save();
+    c.globalAlpha = alpha;
+    c.fillStyle = "white";
+    c.font = `${rtSize}px ui-monospace, "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP", Menlo, Monaco, Consolas, monospace`;
+    c.textAlign = "center";
+    c.textBaseline = "top";
+    const step = Math.max(10, Math.round(rtSize * 1.08));
+    const chars = [...text];
+    const totalH = chars.length * step;
+    let y = yTop + Math.max(0, (height - totalH) * 0.5);
+    for (let i=0;i<chars.length;i++){
+      c.fillText(chars[i], x, y);
+      y += step;
+      if (y > yTop + height - step*0.5) break;
+    }
+    c.restore();
+  }
+
+  let fbScale = 0.22; // low-res feedback
+  function recomputeLayout(){
+    cellW = Math.max(10, Math.round(BASE.cellW*scale));
+    cellH = Math.max(18, Math.round(BASE.cellH*scale));
+    rbSize= Math.max(12, Math.round(BASE.rb*scale));
+    rtSize= Math.max(8,  Math.round(BASE.rt*scale));
+    railW = Math.max(8,  Math.round(BASE.rail*scale));
+
+    const w=innerWidth,h=innerHeight;
+    cvs.width=w; cvs.height=h;
+    gc.width=w;  gc.height=h;
+    gctx.setTransform(1,0,0,1,0,0);
+    ctx.setTransform(1,0,0,1,0,0);
+
+    COLS = Math.ceil(w / cellW) + 1;
+    ROWS = Math.ceil(h / cellH) + 1;
+    camX=new Array(COLS);
+    for(let x=0;x<COLS;x++) camX[x]=(x/(COLS-1))*2-1;
+
+    fbC.width = Math.max(64, Math.floor(w*fbScale));
+    fbC.height = Math.max(64, Math.floor(h*fbScale));
+  }
+  window.addEventListener("resize", recomputeLayout);
+  recomputeLayout();
+
+  /* ===== feedback + sampling ===== */
+  function buildFeedbackFromGlyphs(){
+    const w=fbC.width, h=fbC.height;
+    // persistence
+    fbCtx.save();
+    fbCtx.globalCompositeOperation="source-over";
+    fbCtx.globalAlpha=0.965;
+    fbCtx.drawImage(fbC, 0.6, -0.2, w, h);
+    fbCtx.restore();
+
+    // inject glyph surface
+    fbCtx.save();
+    fbCtx.globalCompositeOperation="lighter";
+    fbCtx.globalAlpha=0.62;
+    fbCtx.drawImage(gc, 0, 0, w, h);
+    fbCtx.restore();
+
+    // damping to avoid runaway
+    fbCtx.save();
+    fbCtx.globalCompositeOperation="multiply";
+    fbCtx.globalAlpha=0.18;
+    fbCtx.fillStyle="rgb(20,18,26)";
+    fbCtx.fillRect(0,0,w,h);
+    fbCtx.restore();
+  }
+
+  function sampleFeedback(){
+    // coarse sampling to modulate sumi strokes (cheap)
+    const sw = Math.max(32, (COLS/2)|0);
+    const sh = Math.max(24, (ROWS/2)|0);
+    try{
+      const img = fbCtx.getImageData(0,0, Math.min(sw, fbC.width), Math.min(sh, fbC.height));
+      return {img, sw:img.width, sh:img.height};
+    }catch(_){
+      return null;
+    }
+  }
+
+  /* ===== render ===== */
+  const SKY=[70,150,255], FLOOR=[255,140,105], BG=[5,6,7];
+  const WALL_GAMMA=0.72;
+  const FEATHER=0.95;
+  let smFps=60, last=performance.now();
+  let vx=0, vy=0;
+
+  function frame(now){
+    const dt=Math.min(0.05,(now-last)/1000);
+    last=now;
+    const fps=dt>0?1/dt:60;
+    smFps=smFps*0.92+fps*0.08;
+
+    // movement + smooth look
+    if(started){
+      pa = pa + (paTarget - pa) * 0.16;
+
+      const run = keys.has("shift") ? 1.35 : 1.0;
+      const f = (keys.has("w")?1:0) + (keys.has("s")?-1:0);
+      const st = (keys.has("e")?1:0) + (keys.has("q")?-1:0);
+      const turn = (keys.has("a")?-1:0) + (keys.has("d")?1:0);
+      if(turn) paTarget += turn * 1.25 * dt;
+
+      const accel = 10.2 * run;
+      const maxSpd = 2.35 * run;
+      const damp  = 9.3;
+
+      const fx=Math.cos(pa), fy=Math.sin(pa);
+      const sx=Math.cos(pa+Math.PI/2), sy=Math.sin(pa+Math.PI/2);
+
+      let dx = fx*f + sx*st;
+      let dy = fy*f + sy*st;
+      const mag = Math.hypot(dx,dy);
+      if(mag>1e-6){ dx/=mag; dy/=mag; }
+
+      vx += dx*accel*dt;
+      vy += dy*accel*dt;
+      const k=Math.max(0, 1-damp*dt);
+      vx*=k; vy*=k;
+      const sp=Math.hypot(vx,vy);
+      if(sp>maxSpd){ vx=vx/sp*maxSpd; vy=vy/sp*maxSpd; }
+
+      tryMove(px + vx*dt, py);
+      tryMove(px, py + vy*dt);
+    } else {
+      paTarget = pa;
+    }
+
+    // clear glyph surface
+    gctx.clearRect(0,0,gc.width,gc.height);
+    gctx.fillStyle = rgb(BG,1);
+    gctx.fillRect(0,0,gc.width,gc.height);
+
+    // feedback sample from previous buffer (modulates strokes)
+    const fbSample = sampleFeedback();
+
+    const fontBase = `ui-monospace, "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP", Menlo, Monaco, Consolas, monospace`;
+    gctx.textAlign="center";
+    gctx.textBaseline="middle";
+
+    for(let x=0;x<COLS;x++){
+      const rayA = pa + camX[x]*(FOV/2);
+      const hit = castRay(rayA);
+      const cd = hit.d * Math.cos(rayA - pa);
+      const dNorm = clamp01(cd/FAR);
+      const dWall = Math.pow(dNorm, WALL_GAMMA);
+
+      const wallHf = Math.max(1, Math.min(ROWS, (ROWS/(cd+0.12))*1.25));
+      const topF = (ROWS-wallHf)*0.5;
+      const botF = topF + wallHf;
+
+      const mat = hit.mat;
+      const m = MAT[mat] || MAT[1];
+      const wallCol = shadeRGB(m.base, dWall);
+
+      for(let y=0;y<ROWS;y++){
+        const px0=x*cellW, py0=y*cellH;
+        const wWall = (y>=topF-FEATHER && y<=botF+FEATHER) ? 1 : 0;
+
+        let col = BG;
+        let g="空", r="そら";
+        if (y < topF){
+          col = shadeRGB(SKY, clamp01(0.95 - 0.08*(1-(y/ROWS))));
+          g="空"; r="そら";
+        } else if (y > botF){
+          const t = clamp01((y-botF)/Math.max(1e-3,(ROWS-botF)));
+          col = shadeRGB(FLOOR, lerp(0.85,0.06, Math.pow(t,0.55)));
+          g=((x+y)%17===0)?"砂":"床"; r=(g==="砂")?"すな":"ゆか";
+        } else {
+          col = wallCol;
+          g=m.g; r=m.r;
+        }
+
+        const cx=px0+cellW*0.5, cy=py0+cellH*0.5;
+
+        // base paint
+        gctx.fillStyle = rgb(col, 1);
+        gctx.font = `${rbSize}px ${fontBase}`;
+
+        // 4-pass sumi strokes, modulated by feedback sample (embedded)
+        if (fbSample){
+          const sx = Math.min(fbSample.sw-1, ((x/COLS)*fbSample.sw)|0);
+          const sy = Math.min(fbSample.sh-1, ((y/ROWS)*fbSample.sh)|0);
+          const idx = (sy*fbSample.sw + sx)*4;
+          const rr = fbSample.img.data[idx] / 255;
+          const gg = fbSample.img.data[idx+1] / 255;
+          const bb = fbSample.img.data[idx+2] / 255;
+          const lum = (rr+gg+bb)/3;
+
+          const spreads = [
+            {a:0.16, s:0.24},
+            {a:0.30, s:0.16},
+            {a:0.52, s:0.09},
+            {a:0.78, s:0.03},
+          ];
+          for(const p of spreads){
+            const ox = (rr-0.5)*cellW*p.s*(0.55+lum);
+            const oy = (gg-0.5)*cellH*p.s*(0.55+lum);
+            gctx.save();
+            gctx.globalAlpha = (0.60+lum) * p.a;
+            gctx.translate(ox, oy);
+            gctx.fillText(g, cx, cy);
+            gctx.restore();
+          }
+        } else {
+          gctx.fillText(g, cx, cy);
+        }
+
+        // furigana (always white, part of glyph surface)
+        const furiOp = Math.max(0.12, 1 - dNorm*0.92);
+        if(!modeRail) drawVerticalKana(gctx, r, cx, py0, cellH, furiOp);
+        else drawVerticalKana(gctx, r, px0+cellW-railW*0.5, py0, cellH, furiOp);
+      }
+    }
+
+    // update feedback from glyph surface AFTER glyph draw
+    buildFeedbackFromGlyphs();
+
+    // composite: glyphs are always visible, difference reveals interference
+    ctx.clearRect(0,0,cvs.width,cvs.height);
+    ctx.globalCompositeOperation="source-over";
+    ctx.globalAlpha=1;
+    ctx.drawImage(gc,0,0);
+
+    ctx.globalCompositeOperation="difference";
+    ctx.globalAlpha=0.92;
+    ctx.imageSmoothingEnabled=true;
+    ctx.drawImage(fbC, 0,0, cvs.width,cvs.height);
+
+    // deepen blacks so it doesn't blow out
+    ctx.globalCompositeOperation="multiply";
+    ctx.globalAlpha=0.16;
+    ctx.fillStyle="rgb(18,16,24)";
+    ctx.fillRect(0,0,cvs.width,cvs.height);
+
+    
+    // === RED WALL OUTLINE OVERLAY (not part of diff) ===
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 0.95;
+    ctx.strokeStyle = "rgba(255,60,60,1.0)";
+    ctx.lineWidth = Math.max(2, Math.round(cellW * 0.10));    ctx.restore();
+
+
+    
+    // === RED WALL OUTLINE OVERLAY (SEAM-FREE POLYLINES) ===
+    const wallTop = [];
+    const wallBot = [];
+    const wallMat = [];
+
+    for(let x=0;x<COLS;x++){
+      const rayA = pa + camX[x]*(FOV/2);
+      const hit = castRay(rayA);
+      if(!hit.mat){ wallTop[x]=null; continue; }
+
+      const cd = hit.d * Math.cos(rayA - pa);
+      const wallHf = Math.max(1, Math.min(ROWS, (ROWS/(cd+0.12))*1.25));
+      const topF = (ROWS-wallHf)*0.5;
+      const botF = topF + wallHf;
+
+      wallTop[x] = topF * cellH;
+      wallBot[x] = botF * cellH;
+      wallMat[x] = hit.mat;
+    }
+
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1.0;
+    ctx.strokeStyle = "rgba(255,60,60,1.0)";
+    ctx.lineWidth = Math.max(2, Math.round(cellW * 0.10));
+
+    let x = 0;
+    while(x < COLS){
+      if(wallTop[x] == null){ x++; continue; }
+
+      const mat = wallMat[x];
+      let x0 = x;
+      let x1 = x;
+
+      while(x1+1 < COLS &&
+            wallMat[x1+1] === mat &&
+            wallTop[x1+1] !== null &&
+            Math.abs(wallTop[x1+1] - wallTop[x1]) < cellH*0.75 &&
+            Math.abs(wallBot[x1+1] - wallBot[x1]) < cellH*0.75){
+        x1++;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(x0*cellW, wallTop[x0]);
+      for(let i=x0;i<=x1;i++) ctx.lineTo(i*cellW, wallTop[i]);
+      for(let i=x1;i>=x0;i--) ctx.lineTo((i+1)*cellW, wallBot[i]);
+      ctx.closePath();
+      ctx.stroke();
+
+      x = x1 + 1;
+    }
+    ctx.restore();
+
+
+    hud.textContent =
+`fps ~${smFps.toFixed(1)} | glyph ${rbSize}px | furi ${rtSize}px | mode ${modeRail?"RAIL":"OVER"}
+primary: DIFFERENCE(glyphs, feedback) + 4-pass SUMI`;
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
